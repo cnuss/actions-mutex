@@ -1,0 +1,65 @@
+name: Test / cache rate limit
+
+# How many cache-service calls fit in a minute, and is the budget per job or
+# shared? Each job hammers CreateCacheEntry on a held key until the first 429,
+# then checks whether GetCacheEntryDownloadURL is throttled too. Compare the
+# per-job counts between a one-job and a two-job dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: 'Jobs hammering at once (JSON array)'
+        default: '["a"]'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  hammer:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        job: ${{ fromJSON(inputs.jobs || '["a"]') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB: ${{ matrix.job }}
+        with:
+          script: |
+            const m = require(`${process.env.GITHUB_WORKSPACE}/index.js`);
+            const twirp = m.cacheClient();
+            const key = m.lockKey(`ratelimit-${process.env.GITHUB_RUN_ID}-${process.env.JOB}`);
+            const version = m.versionFor(key);
+
+            const first = await twirp('CreateCacheEntry', { key, version });
+            const url = first.json.signed_upload_url;
+            if (!url) throw new Error(`could not take ${key}: ${first.text}`);
+            await m.publish(twirp, key, url, { v: m.ENVELOPE_VERSION });
+
+            // Start at a minute boundary so the count covers one whole window.
+            await new Promise((r) => setTimeout(r, 60_000 - (Date.now() % 60_000) + 200));
+            const t0 = Date.now();
+            let calls = 0;
+            let throttled = null;
+            const worker = async () => {
+              while (!throttled && Date.now() - t0 < 59_000) {
+                const r = await twirp('CreateCacheEntry', { key, version });
+                calls += 1;
+                if (r.status === 429 && !throttled) {
+                  throttled = { calls, afterMs: Date.now() - t0, retryAfter: r.headers['retry-after'] };
+                }
+              }
+            };
+            await Promise.all(Array.from({ length: 8 }, worker));
+
+            const read = await twirp('GetCacheEntryDownloadURL', { key, version, restore_keys: [] });
+            const finalizeOther = await twirp('FinalizeCacheEntryUpload', { key: `${key}-none`, version, size_bytes: 1 });
+            const line = `job ${process.env.JOB}: ${calls} CreateCacheEntry calls in the window starting ${new Date(t0).toISOString()}; ` +
+              `first 429: ${throttled ? JSON.stringify(throttled) : 'none'}; ` +
+              `GetCacheEntryDownloadURL right after: HTTP ${read.status}; FinalizeCacheEntryUpload right after: HTTP ${finalizeOther.status}`;
+            core.info(line);
+            await core.summary.addRaw(line).write();
