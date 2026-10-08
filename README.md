@@ -1,6 +1,7 @@
 # actions-mutex
 
 [![CodeQL](https://github.com/cnuss/actions-mutex/actions/workflows/codeql.yml/badge.svg)](https://github.com/cnuss/actions-mutex/actions/workflows/codeql.yml)
+[![Latest release](https://img.shields.io/github/v/release/cnuss/actions-mutex?sort=semver&logo=github)](https://github.com/cnuss/actions-mutex/releases/latest)
 [![Dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot)](https://github.com/cnuss/actions-mutex/security/dependabot)
 [![Security policy](https://img.shields.io/badge/security-policy-brightgreen)](./SECURITY.md)
 
