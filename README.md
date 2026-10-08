@@ -90,9 +90,9 @@ Or lock a single script:
   same key at once.
 - **Not FIFO.** After a release, whichever waiter retries first wins.
 - **Cache-service budget.** The service allows about 200 `CreateCacheEntry`
-  and 1,500 `GetCacheEntryDownloadURL` calls per minute, shared by every job in
-  the repository, `actions/cache` included. A waiter makes about 25 reads and
-  4 creates a minute.
+  and 1,500 `GetCacheEntryDownloadURL` calls per minute, shared across jobs
+  (and most likely across the repository, `actions/cache` included). A waiter
+  makes about 25 reads and 4 creates a minute.
 - **REST budget.** Each acquire and release costs a few REST calls, and each
   waiter makes two more per minute while it waits. `GITHUB_TOKEN` gets 1,000
   REST requests per hour per repository.
