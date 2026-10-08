@@ -41,7 +41,13 @@ jobs:
             const key = m.lockKey(`ratelimit-${process.env.GITHUB_RUN_ID}-${process.env.JOB}`);
             const version = m.versionFor(key);
 
-            const first = await twirp('CreateCacheEntry', { key, version });
+            let first;
+            for (;;) {
+              first = await twirp('CreateCacheEntry', { key, version });
+              if (first.status !== 429) break;
+              core.info(`${new Date().toISOString()} first CreateCacheEntry throttled, retry-after ${first.headers['retry-after']}`);
+              await new Promise((r) => setTimeout(r, Number(first.headers['retry-after'] || 5) * 1000 + 500));
+            }
             const url = first.json.signed_upload_url;
             if (!url) throw new Error(`could not take ${key}: ${first.text}`);
             await m.publish(twirp, key, url, { v: m.ENVELOPE_VERSION });
