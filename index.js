@@ -134,8 +134,17 @@ function cacheClient() {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     }, JSON.stringify(body));
-    return { status: res.status, json: parseJson(res.text), text: res.text };
+    return { status: res.status, json: parseJson(res.text), text: res.text, headers: res.headers };
   };
+}
+
+// Retry-After in seconds or as an HTTP date; BACKOFF_DELAY_MS when absent.
+function throttleDelay(headers) {
+  const v = headers && headers['retry-after'];
+  if (!v) return BACKOFF_DELAY_MS;
+  const secs = Number(v);
+  const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(v) - Date.now();
+  return Math.min(Math.max(ms, RETRY_DELAY_MS), 60_000);
 }
 
 function restClient(token) {
@@ -233,6 +242,7 @@ async function acquire(ctx, holder) {
   const start = Date.now();
   let lastReclaimCheck = start;
   let attempts = 0;
+  const replies = {};
 
   for (;;) {
     attempts += 1;
@@ -246,12 +256,17 @@ async function acquire(ctx, holder) {
       saveState('entry_id', entryId);
       const holderId = await publishHolder(twirp, name, entryId, record);
       saveState('holder_id', holderId);
-      return { entryId, holderId, attempts, waitMs: Date.now() - start };
+      return { entryId, holderId, attempts, replies, waitMs: Date.now() - start };
     }
 
     const throttled = create.status === 429 || create.status >= 500;
     if (!throttled && create.json.code !== 'already_exists') {
       throw new Error(`unexpected CreateCacheEntry response (status ${create.status}): ${create.text}`);
+    }
+    const reply = create.json.code || `http_${create.status}`;
+    replies[reply] = (replies[reply] || 0) + 1;
+    if (throttled && replies[reply] === 1) {
+      log(`[mutex] CreateCacheEntry throttled (HTTP ${create.status}, retry-after ${create.headers['retry-after'] || 'unset'}): ${create.text.slice(0, 200)}`);
     }
     if (attempts === 1) log(`[mutex] "${name}" is held — waiting`);
 
@@ -262,7 +277,7 @@ async function acquire(ctx, holder) {
     if (Date.now() - start >= timeoutMs) {
       throw new Error(`timed out after ${Math.round(timeoutMs / 1000)}s waiting for "${name}"`);
     }
-    await sleep(throttled ? BACKOFF_DELAY_MS : RETRY_DELAY_MS + Math.random() * RETRY_JITTER_MS);
+    await sleep((throttled ? throttleDelay(create.headers) : RETRY_DELAY_MS) + Math.random() * RETRY_JITTER_MS);
   }
 }
 
@@ -314,7 +329,7 @@ async function main() {
 
   const got = await acquire(ctx, holder);
   const waitSeconds = Math.round(got.waitMs / 1000);
-  log(`[mutex] acquired "${ctx.name}" after ${got.attempts} attempts / ${waitSeconds}s (entry ${got.entryId})`);
+  log(`[mutex] acquired "${ctx.name}" after ${got.attempts} attempts / ${waitSeconds}s (entry ${got.entryId}); other replies: ${JSON.stringify(got.replies)}`);
   setOutput('wait-seconds', String(waitSeconds));
 
   if (!script) {
