@@ -97,6 +97,12 @@ Or lock a single script:
 - **REST budget.** Each acquire and release costs a few REST calls, and each
   waiter makes two more per minute while it waits. `GITHUB_TOKEN` gets 1,000
   REST requests per hour per repository.
-- A stuck lock can always be cleared by hand: `gh cache delete 'mutex/<key>'`.
+- **One gap: dying between reserve and finalize.** A lock is reserved and then
+  finalized about 300 ms later. If the job dies inside that window and its post
+  step can't run either (runner lost), the reservation keeps blocking the key
+  for at least 90 minutes, and the REST API can't see it, so it can't be deleted.
+  If only the step dies, the post step finalizes and releases it.
+- A stuck lock that the REST API can see can be cleared by hand:
+  `gh cache delete 'mutex/<key>'`.
 - Set `ACTIONS_STEP_DEBUG=true` (or re-run with debug logging) to log every
   request's method, redacted URL, status, headers, and body.
