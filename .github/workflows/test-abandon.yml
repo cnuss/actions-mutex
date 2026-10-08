@@ -1,0 +1,77 @@
+name: Test / abandoned locks
+
+# A holder that fails, times out, or loses its runner must not keep the lock.
+#   failure, timeout: the post step releases, so the waiter gets in quickly.
+#   crash:            post never runs; the waiter reclaims once the holder's
+#                     job is marked completed.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - action.yml
+      - .github/workflows/test-abandon.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  holder:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [failure, timeout, crash]
+    timeout-minutes: ${{ matrix.scenario == 'timeout' && 2 || 10 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: ./
+        with:
+          key: abandon-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Fail while holding
+        if: matrix.scenario == 'failure'
+        run: sleep 20 && exit 1
+
+      - name: Outlive the job timeout while holding
+        if: matrix.scenario == 'timeout'
+        run: sleep 600
+
+      # SIGKILL the worker so no post step runs.
+      - name: Kill the runner while holding
+        if: matrix.scenario == 'crash'
+        run: sleep 20 && sudo pkill -9 -f Runner.Worker
+
+  waiter:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: failure
+            max-wait: 60
+          - scenario: timeout
+            max-wait: 180
+          - scenario: crash
+            max-wait: 1500
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Let the holder win.
+      - run: sleep 15
+
+      - id: lock
+        uses: ./
+        with:
+          key: abandon-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          timeout-seconds: ${{ matrix.max-wait }}
+
+      - name: Report
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          WAIT: ${{ steps.lock.outputs.wait-seconds }}
+        run: echo "${SCENARIO} waited ${WAIT}s" | tee -a "$GITHUB_STEP_SUMMARY"

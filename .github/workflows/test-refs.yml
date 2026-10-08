@@ -1,0 +1,38 @@
+name: Test / cross-ref
+
+# Are locks shared across refs? Dispatch this on two refs at once with the same
+# key; each run holds the lock for a while and reports when it got it. If the
+# second run's wait is near zero while the first still holds, locks are per ref.
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: 'Lock name, the same for both dispatches'
+        required: true
+      hold-seconds:
+        default: '90'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  hold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - id: lock
+        uses: ./
+        with:
+          key: ${{ inputs.key }}
+
+      - name: Hold
+        env:
+          WAIT: ${{ steps.lock.outputs.wait-seconds }}
+          HOLD: ${{ inputs.hold-seconds }}
+        run: |
+          echo "${GITHUB_REF}: acquired at $(date -u +%H:%M:%S) after ${WAIT}s" | tee -a "$GITHUB_STEP_SUMMARY"
+          sleep "$HOLD"
+          echo "${GITHUB_REF}: done at $(date -u +%H:%M:%S)" | tee -a "$GITHUB_STEP_SUMMARY"

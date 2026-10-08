@@ -1,0 +1,61 @@
+name: Test / unfinalized reservation
+
+# A holder that dies between CreateCacheEntry and FinalizeCacheEntryUpload
+# leaves a reservation the REST API can't see or delete. How long does it keep
+# blocking the key? Reserve without finalizing, then retry CreateCacheEntry
+# until it wins or the job runs out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'How long to keep probing'
+        default: '90'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          MINUTES: ${{ inputs.minutes || '90' }}
+        with:
+          script: |
+            const m = require(`${process.env.GITHUB_WORKSPACE}/index.js`);
+            const twirp = m.cacheClient();
+            const key = m.lockKey(`unfinalized-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`);
+            const version = m.versionFor(key);
+            const create = () => twirp('CreateCacheEntry', { key, version });
+
+            const first = await create();
+            if (!first.json.signed_upload_url) throw new Error(`first reservation failed: ${first.text}`);
+            const t0 = Date.now();
+            core.info(`reserved ${key}; not finalizing`);
+
+            const { data } = await github.rest.actions.getActionsCacheList({ ...context.repo, key });
+            core.info(`REST list sees ${data.actions_caches.length} entries for the reservation`);
+
+            const deadline = t0 + Number(process.env.MINUTES) * 60_000;
+            let codes = {};
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 30_000));
+              const r = await create();
+              const min = ((Date.now() - t0) / 60_000).toFixed(1);
+              if (r.json.signed_upload_url) {
+                core.summary.addRaw(`Reservation stopped blocking after **${min} min**. Replies before that: ${JSON.stringify(codes)}`);
+                await core.summary.write();
+                return;
+              }
+              const code = r.json.code || `http_${r.status}`;
+              codes[code] = (codes[code] || 0) + 1;
+              if (codes[code] === 1 || Number(min) % 10 < 0.5) core.info(`${min} min: ${code}`);
+            }
+            core.summary.addRaw(`Reservation still blocking after **${process.env.MINUTES} min**. Replies: ${JSON.stringify(codes)}`);
+            await core.summary.write();

@@ -1,0 +1,119 @@
+name: Test / contention
+
+# Workers race for one lock, half holding it for the rest of the job and half
+# through `run`. verify fails if any two critical sections overlap.
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Workers per mode (JSON array)'
+        default: '["1","2","3","4"]'
+      hold-seconds:
+        description: 'Critical section length'
+        default: '10'
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - action.yml
+      - .github/workflows/test-contend.yml
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  LOCK: contend-${{ github.run_id }}-${{ github.run_attempt }}
+  HOLD_SECONDS: ${{ inputs.hold-seconds || '10' }}
+
+jobs:
+  bare:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJSON(inputs.workers || '["1","2","3","4"]') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Acquire
+        id: lock
+        uses: ./
+        with:
+          key: ${{ env.LOCK }}
+
+      - name: Critical section
+        env:
+          WORKER: bare-${{ matrix.worker }}
+          WAIT: ${{ steps.lock.outputs.wait-seconds }}
+        run: |
+          start=$(date +%s%3N); sleep "$HOLD_SECONDS"; end=$(date +%s%3N)
+          jq -n --arg w "$WORKER" --argjson s "$start" --argjson e "$end" --argjson wait "$WAIT" \
+            '{worker:$w, start:$s, end:$e, wait:$wait}' > "interval-$WORKER.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: interval-bare-${{ matrix.worker }}
+          path: interval-bare-${{ matrix.worker }}.json
+
+  wrapped:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJSON(inputs.workers || '["1","2","3","4"]') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Acquire, run, release
+        id: lock
+        uses: ./
+        env:
+          WORKER: wrapped-${{ matrix.worker }}
+        with:
+          key: ${{ env.LOCK }}
+          run: |
+            start=$(date +%s%3N); sleep "$HOLD_SECONDS"; end=$(date +%s%3N)
+            jq -n --arg w "$WORKER" --argjson s "$start" --argjson e "$end" \
+              '{worker:$w, start:$s, end:$e}' > "interval-$WORKER.json"
+
+      - name: Record wait
+        env:
+          WORKER: wrapped-${{ matrix.worker }}
+          WAIT: ${{ steps.lock.outputs.wait-seconds }}
+        run: jq --argjson wait "$WAIT" '. + {wait:$wait}' "interval-$WORKER.json" > tmp && mv tmp "interval-$WORKER.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: interval-wrapped-${{ matrix.worker }}
+          path: interval-wrapped-${{ matrix.worker }}.json
+
+  verify:
+    needs: [bare, wrapped]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: interval-*
+          path: intervals
+          merge-multiple: true
+
+      - name: Check for overlapping critical sections
+        run: |
+          jq -s 'sort_by(.start)' intervals/*.json > all.json
+          {
+            echo '### Critical sections in acquire order'
+            echo
+            echo '| worker | wait s | start | held s | gap from previous ms |'
+            echo '|---|---|---|---|---|'
+            jq -r '. as $a | range(0; length) | . as $i | $a[$i]
+              | "| \(.worker) | \(.wait) | \(.start / 1000 | todate) | \((.end - .start) / 1000) | \(if $i > 0 then .start - $a[$i-1].end else "" end) |"' all.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          overlaps=$(jq -r '. as $a | [range(1; length) | select($a[.].start < $a[.-1].end) | "\($a[.-1].worker)/\($a[.].worker)"] | join(", ")' all.json)
+          if [ -n "$overlaps" ]; then
+            echo "::error::overlapping critical sections: $overlaps"
+            exit 1
+          fi
+          echo "no overlaps across $(jq length all.json) critical sections" | tee -a "$GITHUB_STEP_SUMMARY"
