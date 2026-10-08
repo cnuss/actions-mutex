@@ -33,9 +33,17 @@ const { URL } = require('url');
 const { spawnSync } = require('child_process');
 
 const ENVELOPE_VERSION = 'mutex-v1';
-const RETRY_DELAY_MS = 1000;
-const RETRY_JITTER_MS = 1000;
-const BACKOFF_DELAY_MS = 3000; // when the service rate-limits / errors (429/5xx)
+// The cache service allows about 200 CreateCacheEntry and 1,500
+// GetCacheEntryDownloadURL calls per minute, shared with every other job (and
+// actions/cache) in the repository. Waiters therefore poll with the cheaper
+// read and only race CreateCacheEntry when the lock looks free.
+const POLL_DELAY_MS = 2000;
+const POLL_JITTER_MS = 1000;
+// A stale replica can keep showing a released lock; race anyway this often.
+const CREATE_FALLBACK_MS = 15_000;
+const MAX_POLL_DELAY_MS = 30_000;
+const BACKOFF_DELAY_MS = 3000; // 429/5xx without Retry-After
+const HOLDER_PUBLISH_ATTEMPTS = 4;
 // Abandonment checks cost two REST calls, and GITHUB_TOKEN gets 1,000 REST
 // requests per hour per repository.
 const RECLAIM_CHECK_INTERVAL_MS = 60_000;
@@ -138,13 +146,15 @@ function cacheClient() {
   };
 }
 
+function isThrottled(res) { return res.status === 429 || res.status >= 500; }
+
 // Retry-After in seconds or as an HTTP date; BACKOFF_DELAY_MS when absent.
-function throttleDelay(headers) {
+function retryAfterMs(headers) {
   const v = headers && headers['retry-after'];
   if (!v) return BACKOFF_DELAY_MS;
   const secs = Number(v);
   const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(v) - Date.now();
-  return Math.min(Math.max(ms, RETRY_DELAY_MS), 60_000);
+  return Math.min(Math.max(ms, 0), 60_000);
 }
 
 function restClient(token) {
@@ -233,63 +243,95 @@ async function reclaimIfAbandoned({ twirp, rest, name }) {
   return true;
 }
 
-// Retries CreateCacheEntry until it wins or the timeout passes. `holder` is
-// published alongside the lock so waiters can tell when it was abandoned.
+// Waits for the lock: reads until it looks free, then races CreateCacheEntry.
+// `holder` is published alongside the lock so waiters can tell when it was
+// abandoned.
 async function acquire(ctx, holder) {
   const { twirp, name, timeoutMs } = ctx;
   const key = lockKey(name);
   const version = versionFor(key);
   const start = Date.now();
-  let lastReclaimCheck = start;
-  let attempts = 0;
   const replies = {};
+  const count = (reply) => { replies[reply] = (replies[reply] || 0) + 1; return replies[reply]; };
+  let lastReclaimCheck = start;
+  let lastCreate = 0;
+  let looksFree = true;
+  let delay = POLL_DELAY_MS;
+  let creates = 0;
+  let loggedThrottle = false;
 
   for (;;) {
-    attempts += 1;
-    const create = await twirp('CreateCacheEntry', { key, version });
-    const uploadUrl = create.json.signed_upload_url || create.json.signedUploadUrl;
-    if (uploadUrl) {
-      // If this process dies before release, post finalizes and deletes from here.
-      saveState('upload_url', uploadUrl);
-      const record = { v: ENVELOPE_VERSION, ...holder, acquired_at: new Date().toISOString() };
-      const entryId = await publish(twirp, key, uploadUrl, record);
-      saveState('entry_id', entryId);
-      const holderId = await publishHolder(twirp, name, entryId, record);
-      saveState('holder_id', holderId);
-      return { entryId, holderId, attempts, replies, waitMs: Date.now() - start };
+    let res;
+    if (looksFree || Date.now() - lastCreate >= CREATE_FALLBACK_MS) {
+      lastCreate = Date.now();
+      creates += 1;
+      res = await twirp('CreateCacheEntry', { key, version });
+      const uploadUrl = res.json.signed_upload_url || res.json.signedUploadUrl;
+      if (uploadUrl) {
+        // If this process dies before release, post finalizes and deletes from here.
+        saveState('upload_url', uploadUrl);
+        const record = { v: ENVELOPE_VERSION, ...holder, acquired_at: new Date().toISOString() };
+        const entryId = await publish(twirp, key, uploadUrl, record);
+        saveState('entry_id', entryId);
+        const holderId = await publishHolder(twirp, name, entryId, record);
+        saveState('holder_id', holderId);
+        return { entryId, holderId, creates, replies, waitMs: Date.now() - start };
+      }
+      if (!isThrottled(res) && res.json.code !== 'already_exists') {
+        throw new Error(`unexpected CreateCacheEntry response (status ${res.status}): ${res.text}`);
+      }
+      count(`create:${res.json.code || `http_${res.status}`}`);
+      looksFree = false;
+      if (creates === 1 && !isThrottled(res)) log(`[mutex] "${name}" is held — waiting`);
+    } else {
+      res = await twirp('GetCacheEntryDownloadURL', { key, version, restore_keys: [] });
+      if (!isThrottled(res)) {
+        looksFree = res.json.ok !== true;
+        count(looksFree ? 'read:free' : 'read:held');
+        if (looksFree) continue;
+      } else {
+        count(`read:http_${res.status}`);
+      }
     }
 
-    const throttled = create.status === 429 || create.status >= 500;
-    if (!throttled && create.json.code !== 'already_exists') {
-      throw new Error(`unexpected CreateCacheEntry response (status ${create.status}): ${create.text}`);
+    if (isThrottled(res)) {
+      if (!loggedThrottle) {
+        loggedThrottle = true;
+        log(`[mutex] cache service throttled (HTTP ${res.status}, retry-after ${res.headers['retry-after'] || 'unset'}): ${res.text.slice(0, 200)}`);
+      }
+      delay = Math.min(delay * 2, MAX_POLL_DELAY_MS);
+    } else {
+      delay = Math.max(delay * 0.9, POLL_DELAY_MS);
     }
-    const reply = create.json.code || `http_${create.status}`;
-    replies[reply] = (replies[reply] || 0) + 1;
-    if (throttled && replies[reply] === 1) {
-      log(`[mutex] CreateCacheEntry throttled (HTTP ${create.status}, retry-after ${create.headers['retry-after'] || 'unset'}): ${create.text.slice(0, 200)}`);
-    }
-    if (attempts === 1) log(`[mutex] "${name}" is held — waiting`);
 
     if (Date.now() - lastReclaimCheck >= RECLAIM_CHECK_INTERVAL_MS) {
       lastReclaimCheck = Date.now();
-      if (await reclaimIfAbandoned(ctx)) continue;
+      if (await reclaimIfAbandoned(ctx)) { looksFree = true; continue; }
     }
     if (Date.now() - start >= timeoutMs) {
       throw new Error(`timed out after ${Math.round(timeoutMs / 1000)}s waiting for "${name}"`);
     }
-    await sleep((throttled ? throttleDelay(create.headers) : RETRY_DELAY_MS) + Math.random() * RETRY_JITTER_MS);
+    // After a 429, spread waiters across the next window instead of all
+    // retrying the moment it opens.
+    const wait = isThrottled(res) ? retryAfterMs(res.headers) + Math.random() * delay : delay + Math.random() * POLL_JITTER_MS;
+    await sleep(wait);
   }
 }
 
+// The holder record makes an abandoned lock reclaimable, so it is worth
+// waiting out a throttled window for.
 async function publishHolder(twirp, name, entryId, record) {
   const key = holderKey(name, entryId);
-  const create = await twirp('CreateCacheEntry', { key, version: versionFor(key) });
-  const uploadUrl = create.json.signed_upload_url || create.json.signedUploadUrl;
-  if (!uploadUrl) {
-    warn(`could not publish holder record ${key}; if this job dies holding the lock, it must be deleted by hand: ${create.text}`);
-    return '';
+  let create;
+  for (let tries = 1; tries <= HOLDER_PUBLISH_ATTEMPTS; tries += 1) {
+    create = await twirp('CreateCacheEntry', { key, version: versionFor(key) });
+    const uploadUrl = create.json.signed_upload_url || create.json.signedUploadUrl;
+    if (uploadUrl) return publish(twirp, key, uploadUrl, record);
+    if (!isThrottled(create)) break;
+    await sleep(retryAfterMs(create.headers) + Math.random() * POLL_JITTER_MS);
   }
-  return publish(twirp, key, uploadUrl, record);
+  warn(`could not publish holder record ${key}; if this job dies holding the lock, delete it by hand: ${create.text}`);
+  return '';
 }
 
 async function release({ rest, name }, entryId, holderId) {
@@ -329,7 +371,7 @@ async function main() {
 
   const got = await acquire(ctx, holder);
   const waitSeconds = Math.round(got.waitMs / 1000);
-  log(`[mutex] acquired "${ctx.name}" after ${got.attempts} attempts / ${waitSeconds}s (entry ${got.entryId}); other replies: ${JSON.stringify(got.replies)}`);
+  log(`[mutex] acquired "${ctx.name}" after ${waitSeconds}s (entry ${got.entryId}); replies while waiting: ${JSON.stringify(got.replies)}`);
   setOutput('wait-seconds', String(waitSeconds));
 
   if (!script) {
