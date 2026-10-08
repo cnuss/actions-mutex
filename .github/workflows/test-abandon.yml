@@ -21,6 +21,8 @@ permissions:
 jobs:
   holder:
     runs-on: ubuntu-latest
+    # Each scenario ends this job badly on purpose; the waiters are the test.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

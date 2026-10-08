@@ -69,21 +69,30 @@ Or lock a single script:
    uploads a small record naming its job and finalizes it immediately, so the
    entry exists and can be deleted. It also publishes
    `mutex/<key>/holder/<entry id>` with the same record.
-2. **Wait**: losers get `already_exists` and retry every 1–2 s with jitter.
+2. **Wait**: losers poll `GetCacheEntryDownloadURL` every 2–3 s and race
+   `CreateCacheEntry` again only when the lock looks free, or every 15 s in
+   case a lagging replica still shows a released lock. On a 429 they wait out
+   `Retry-After` and spread their retries across the next window.
 3. **Release**: `DELETE /repos/{repo}/actions/caches/{entry id}`, from the post
    step (or right after `run` exits). Post runs on failure and cancellation
    too.
 4. **Abandoned locks**: if the holder's runner dies before post can run, a
-   waiter notices within about a minute: it reads the holder record for the
-   current lock entry, sees that job has completed, and deletes the lock.
+   waiter notices within about a minute of the job ending: it reads the holder
+   record for the current lock entry, sees that job has completed, and deletes
+   the lock.
 
 ## Notes
 
 - Dependency-free: no `node_modules`, no bundling, no build step. Node 24.
 - Needs `permissions: actions: write` in the calling job.
 - **Locks are per ref.** Cache entries are scoped to the branch or PR ref that
-  wrote them.
+  wrote them, so a run on `main` and a run on a feature branch can hold the
+  same key at once.
 - **Not FIFO.** After a release, whichever waiter retries first wins.
+- **Cache-service budget.** The service allows about 200 `CreateCacheEntry`
+  and 1,500 `GetCacheEntryDownloadURL` calls per minute, shared by every job in
+  the repository, `actions/cache` included. A waiter makes about 25 reads and
+  4 creates a minute.
 - **REST budget.** Each acquire and release costs a few REST calls, and each
   waiter makes two more per minute while it waits. `GITHUB_TOKEN` gets 1,000
   REST requests per hour per repository.
