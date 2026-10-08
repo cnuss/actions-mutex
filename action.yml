@@ -1,0 +1,43 @@
+name: 'Mutex'
+description: >-
+  Serialize work across concurrent jobs and runs that share a key. One job
+  holds the lock at a time; the rest wait their turn. A distributed mutex built
+  on the Actions cache service.
+author: 'cnuss'
+
+inputs:
+  key:
+    description: >-
+      Lock name. Every job that runs this action with the same key takes turns.
+    required: true
+  run:
+    description: >-
+      Bash script run while holding the lock; the lock is released as soon as
+      it exits, and a non-zero exit fails the step. Without `run`, the lock is
+      held until the job ends and released in the post step.
+    required: false
+    default: ''
+  timeout-seconds:
+    description: 'How long to wait for the lock before failing.'
+    required: false
+    default: '3600'
+  github-token:
+    description: >-
+      Token for the REST calls: finding this job, deleting the lock entry, and
+      checking whether a holder's job has ended. Needs `actions: write`.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  wait-seconds:
+    description: 'Seconds spent waiting for the lock.'
+
+runs:
+  using: 'node24'
+  main: 'index.js'
+  post: 'index.js'
+  post-if: always()
+
+branding:
+  icon: 'lock'
+  color: 'purple'

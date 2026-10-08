@@ -1,0 +1,95 @@
+name: Release
+
+# Manual release: tag vX.Y.Z at the current commit, (re)point the moving major
+# tag vX at it, and publish a GitHub Release. Mirrors the manual flow:
+#   git tag vX.Y.Z ; git tag -f vX ; push ; gh release create
+# Done via the REST API (gh) — no checkout, no node.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. v1.0.2 (must be vMAJOR.MINOR.PATCH)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+      notes:
+        description: 'Release notes (leave blank to auto-generate from commits)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      VERSION: ${{ inputs.version }}
+      NOTES: ${{ inputs.notes }}
+      PRERELEASE: ${{ inputs.prerelease }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version '$VERSION' must match vMAJOR.MINOR.PATCH (e.g. v1.0.2)"
+            exit 1
+          fi
+          major="${VERSION%%.*}"            # v1.0.2 -> v1
+          echo "MAJOR=$major" >> "$GITHUB_ENV"
+          echo "Releasing $VERSION (major $major) at $SHA"
+
+          if gh api "repos/$REPO/git/ref/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag $VERSION already exists — bump the version"
+            exit 1
+          fi
+
+      - name: Create release + semver tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(-R "$REPO" --target "$SHA" --title "$VERSION")
+          [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
+          if [ -n "${NOTES// }" ]; then
+            args+=(--notes "$NOTES")
+          else
+            args+=(--generate-notes)
+          fi
+          # gh release create creates the lightweight tag $VERSION at --target.
+          gh release create "$VERSION" "${args[@]}"
+          echo "released $VERSION"
+
+      - name: Move major tag ($MAJOR -> this commit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$REPO/git/refs/tags/$MAJOR" \
+              -f sha="$SHA" -F force=true >/dev/null
+            echo "moved $MAJOR -> $SHA"
+          else
+            gh api --method POST "repos/$REPO/git/refs" \
+              -f ref="refs/tags/$MAJOR" -f sha="$SHA" >/dev/null
+            echo "created $MAJOR -> $SHA"
+          fi
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## Released $VERSION"
+            echo ""
+            echo "- commit: \`$SHA\`"
+            echo "- moving major \`$MAJOR\` -> this commit"
+            echo "- consumers pin: \`uses: $REPO@$MAJOR\`"
+            echo "- release: ${{ github.server_url }}/$REPO/releases/tag/$VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
