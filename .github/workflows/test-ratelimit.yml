@@ -1,9 +1,9 @@
 name: Test / cache rate limit
 
 # How many cache-service calls fit in a minute, and is the budget per job or
-# shared? Each job hammers CreateCacheEntry on a held key until the first 429,
-# then checks whether GetCacheEntryDownloadURL is throttled too. Compare the
-# per-job counts between a one-job and a two-job dispatch.
+# shared? Each job hammers one call on a held key until the first 429, then
+# checks whether the other calls are throttled too. Compare the per-job counts
+# between a one-job and a two-job dispatch.
 
 on:
   workflow_dispatch:
@@ -11,6 +11,11 @@ on:
       jobs:
         description: 'Jobs hammering at once (JSON array)'
         default: '["a"]'
+      method:
+        description: 'Call to hammer'
+        type: choice
+        options: [CreateCacheEntry, GetCacheEntryDownloadURL]
+        default: CreateCacheEntry
 
 permissions:
   actions: write
@@ -28,6 +33,7 @@ jobs:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           JOB: ${{ matrix.job }}
+          METHOD: ${{ inputs.method || 'CreateCacheEntry' }}
         with:
           script: |
             const m = require(`${process.env.GITHUB_WORKSPACE}/index.js`);
@@ -47,7 +53,9 @@ jobs:
             let throttled = null;
             const worker = async () => {
               while (!throttled && Date.now() - t0 < 59_000) {
-                const r = await twirp('CreateCacheEntry', { key, version });
+                const r = process.env.METHOD === 'CreateCacheEntry'
+                  ? await twirp('CreateCacheEntry', { key, version })
+                  : await twirp('GetCacheEntryDownloadURL', { key, version, restore_keys: [] });
                 calls += 1;
                 if (r.status === 429 && !throttled) {
                   throttled = { calls, afterMs: Date.now() - t0, retryAfter: r.headers['retry-after'] };
@@ -58,7 +66,7 @@ jobs:
 
             const read = await twirp('GetCacheEntryDownloadURL', { key, version, restore_keys: [] });
             const finalizeOther = await twirp('FinalizeCacheEntryUpload', { key: `${key}-none`, version, size_bytes: 1 });
-            const line = `job ${process.env.JOB}: ${calls} CreateCacheEntry calls in the window starting ${new Date(t0).toISOString()}; ` +
+            const line = `job ${process.env.JOB}: ${calls} ${process.env.METHOD} calls in the window starting ${new Date(t0).toISOString()}; ` +
               `first 429: ${throttled ? JSON.stringify(throttled) : 'none'}; ` +
               `GetCacheEntryDownloadURL right after: HTTP ${read.status}; FinalizeCacheEntryUpload right after: HTTP ${finalizeOther.status}`;
             core.info(line);
